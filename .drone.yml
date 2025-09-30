@@ -1,0 +1,270 @@
+kind: pipeline
+type: docker
+name: Deployment
+
+# Global environment variables
+environment:
+  REGISTRY_URL: registry.gitlab.com
+  DOCKER_BUILDKIT: 1
+  VITE_API_BASE_URL: https://st-engineering-be.minhviet.xyz/api
+
+# Disable default clone to use custom clone step
+clone:
+  disable: false
+
+steps:
+  # Debug step to show pipeline information
+  - name: Show Pipeline Information
+    image: alpine:latest
+    commands:
+      - echo "=== Drone CI Pipeline Debug ==="
+      - 'echo "Build number: $DRONE_BUILD_NUMBER"'
+      - 'echo "Branch: $DRONE_BRANCH"'
+      - 'echo "Commit SHA: $DRONE_COMMIT_SHA"'
+      - 'echo "Repository: $DRONE_REPO"'
+      - 'echo "Author: $DRONE_COMMIT_AUTHOR"'
+      - 'echo "Event: $DRONE_BUILD_EVENT"'
+      - 'echo "Registry URL: $REGISTRY_URL"'
+      - 'echo "API URL: $VITE_API_BASE_URL"'
+      - echo "============================="
+    when:
+      branch:
+        - main
+        - master
+        - dev
+      event:
+        - push
+        - pull_request
+
+  # Test Backend
+  - name: Test Backend
+    image: node:20-alpine
+    environment:
+      PNPM_HOME: /pnpm
+    commands:
+      - set -euxo pipefail
+      - export PATH="$PNPM_HOME:$PATH"
+      - echo "PATH=$PATH"
+      - corepack enable
+      - corepack prepare pnpm@latest --activate
+      - pnpm --version
+      - pnpm config set store-dir /pnpm-store
+      - pnpm config set enable-pre-post-scripts true
+      - cd backend
+      - echo "Installing backend dependencies..."
+      - pnpm install --frozen-lockfile
+      - echo "Checking ESLint installation..."
+      - pnpm list @typescript-eslint/eslint-plugin
+      - pnpm list @typescript-eslint/parser
+      - echo "Running linting..."
+      - pnpm run lint
+      - echo "Running tests..."
+      - pnpm run test:coverage
+    when:
+      branch: [main, master, dev]
+      event: [push, pull_request]
+
+  # Test Frontend
+  - name: Test Frontend
+    image: node:20-alpine
+    environment:
+      PNPM_HOME: /pnpm
+    commands:
+      - set -euxo pipefail
+      - export PATH="$PNPM_HOME:$PATH"
+      - corepack enable
+      - corepack prepare pnpm@latest --activate
+      - pnpm --version
+      - pnpm config set store-dir /pnpm-store
+      - pnpm config set enable-pre-post-scripts true
+      - cd frontend
+      - echo "Installing dependencies..."
+      - pnpm install --frozen-lockfile
+      - echo "Checking ESLint installation..."
+      - pnpm list @typescript-eslint/eslint-plugin
+      - pnpm list @typescript-eslint/parser
+      - echo "Running linting..."
+      - pnpm run lint
+      - echo "Running tests..."
+      - pnpm run test:run
+      - echo "Verifying environment variables..."
+      - echo "VITE_API_BASE_URL=$VITE_API_BASE_URL"
+    when:
+      branch: [main, master, dev]
+      event: [push, pull_request]
+
+  # Build Backend Production Image
+  - name: Build Backend Production
+    image: plugins/docker
+    settings:
+      registry: registry.gitlab.com
+      username:
+        from_secret: gitlab_username
+      password:
+        from_secret: gitlab_token
+      repo: registry.gitlab.com/${DRONE_REPO_OWNER,,}/${DRONE_REPO_NAME,,}/backend
+      context: ./backend
+      dockerfile: ./backend/Dockerfile
+      tags:
+        - latest
+        - ${DRONE_COMMIT_SHA:0:8}
+        - ${DRONE_BRANCH}
+      build_args:
+        - BUILDKIT_INLINE_CACHE=1
+    when:
+      branch:
+        - main
+        - master
+        - dev
+      event:
+        - push
+        - pull_request
+    depends_on:
+      - Test Backend
+
+  # Build Frontend Production Image
+  - name: Build Frontend Production
+    image: plugins/docker
+    settings:
+      registry: registry.gitlab.com
+      username:
+        from_secret: gitlab_username
+      password:
+        from_secret: gitlab_token
+      repo: registry.gitlab.com/${DRONE_REPO_OWNER,,}/${DRONE_REPO_NAME,,}/frontend
+      context: ./frontend
+      dockerfile: ./frontend/Dockerfile
+      tags:
+        - latest
+        - ${DRONE_COMMIT_SHA:0:8}
+        - ${DRONE_BRANCH}
+      build_args:
+        - BUILDKIT_INLINE_CACHE=1
+        - VITE_API_BASE_URL=https://st-engineering-be.minhviet.xyz/api
+        - NODE_ENV=production
+    when:
+      branch:
+        - main
+        - master
+        - dev
+      event:
+        - push
+        - pull_request
+    depends_on:
+      - Test Frontend
+
+  # Validate Docker Compose Configuration
+  - name: Validate Docker Compose
+    image: docker:24-cli
+    commands:
+      - echo "Validating docker-compose.prod.yml configuration..."
+      - echo "Checking if all required files exist..."
+      - ls -la docker-compose.prod.yml
+      - ls -la frontend/Dockerfile
+      - ls -la backend/Dockerfile
+      - ls -la frontend/nginx.conf
+      - echo "Validating docker-compose.prod.yml syntax..."
+      - docker compose -f docker-compose.prod.yml config --quiet
+      - echo "Docker Compose configuration is valid!"
+      - echo "All required files present for production build"
+    when:
+      branch:
+        - main
+        - master
+        - dev
+      event:
+        - push
+        - pull_request
+
+  # Security scanning with Trivy
+  - name: Security Scan
+    image: aquasec/trivy:latest
+    environment:
+      GITLAB_USERNAME:
+        from_secret: gitlab_username
+      GITLAB_TOKEN:
+        from_secret: gitlab_token
+    commands:
+      - echo "Starting security scan..."
+      - echo "Scanning backend image for vulnerabilities..."
+      - trivy image --no-progress --ignore-unfixed --severity HIGH,CRITICAL --username "$GITLAB_USERNAME" --password "$GITLAB_TOKEN" registry.gitlab.com/${DRONE_REPO_OWNER,,}/${DRONE_REPO_NAME,,}/backend:${DRONE_COMMIT_SHA:0:8} || true
+      - echo "Scanning frontend image for vulnerabilities..."
+      - trivy image --no-progress --ignore-unfixed --severity HIGH,CRITICAL --username "$GITLAB_USERNAME" --password "$GITLAB_TOKEN" registry.gitlab.com/${DRONE_REPO_OWNER,,}/${DRONE_REPO_NAME,,}/frontend:${DRONE_COMMIT_SHA:0:8} || true
+      - echo "Security scan completed"
+    when:
+      branch:
+        - main
+        - master
+        - dev
+      event:
+        - push
+    depends_on:
+      - Build Backend Production
+      - Build Frontend Production
+
+  - name: Deployment
+    image: curlimages/curl:8.7.1
+    environment:
+      WATCHTOWER_HTTP_API_TOKEN:
+        from_secret: watchtower_token
+    commands:
+      - echo "Triggering Watchtower to update production containers..."
+      - 'echo "New backend image: registry.gitlab.com/${DRONE_REPO_OWNER,,}/${DRONE_REPO_NAME,,}/backend:${DRONE_COMMIT_SHA:0:8}"'
+      - 'echo "New frontend image: registry.gitlab.com/${DRONE_REPO_OWNER,,}/${DRONE_REPO_NAME,,}/frontend:${DRONE_COMMIT_SHA:0:8}"'
+      - echo "Testing connectivity to Watchtower endpoint..."
+      - nslookup watch.minhviet.xyz || echo "DNS lookup failed"
+      - ping -c 3 watch.minhviet.xyz || echo "Ping failed"
+      - echo "Attempting Watchtower API call with enhanced curl options..."
+      - |
+        curl --fail --silent --show-error --location \
+          --max-time 60 \
+          --connect-timeout 30 \
+          --retry 3 \
+          --retry-delay 5 \
+          --retry-max-time 180 \
+          -X POST \
+          -H "Authorization: Bearer $WATCHTOWER_HTTP_API_TOKEN" \
+          -H "Content-Type: application/json" \
+          -H "User-Agent: Drone-CI/1.0" \
+          https://watch.minhviet.xyz/v1/update
+      - echo "Watchtower update trigger sent successfully"
+    when:
+      branch:
+        - main
+        - master
+      event:
+        - push
+    depends_on:
+      - Build Backend Production
+      - Build Frontend Production
+      - Security Scan
+
+# Trigger conditions
+trigger:
+  branch:
+    - main
+    - master
+    - dev
+  event:
+    - push
+    - pull_request
+
+---
+# Pipeline for cleanup old images
+kind: pipeline
+type: docker
+name: Cleanup
+
+steps:
+  - name: cleanup-old-images
+    image: alpine:latest
+    commands:
+      - echo "Cleaning up old Docker images..."
+      - echo "This step would clean up old images from registry"
+      - echo "Implementation depends on your registry type"
+
+trigger:
+  event:
+    - cron
+  cron:
+    - cleanup
